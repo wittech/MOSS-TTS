@@ -303,13 +303,6 @@ MOSS‑TTS 在开源零样本 TTS 基准 `Seed‑TTS‑eval` 上取得当前最�
 对于闭源模型，标注者只需在每个样本对中选择整体更偏好的一项，并据此计算胜率。
 ![alt text](assets/VS_Proprietary_Models.png)
 
-#### 主观评测
-对于开源模型，标注者会从说话人归因准确性、音色相似度、韵律与整体质量等维度对每个样本对进行评分。遵循 LMSYS Chatbot Arena 的方法，我们计算各维度的 Elo 评分与置信区间。
-![alt text](assets/VS_Open-Source_Models.jpg)
-
-对于闭源模型，标注者只需在每个样本对中选择整体更偏好的一项，并据此计算胜率。
-![alt text](assets/VS_Proprietary_Models.png)
-
 
 <a id="eval-moss-voicegenerator"></a>
 ### MOSS‑VoiceGenerator 主观评测
