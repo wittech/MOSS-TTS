@@ -81,8 +81,8 @@ class MossTTSRealtimeInference:
                     break
             if attn_impl:
                 break
-        self._use_dynamic_local_cache = attn_impl == "flash_attention_2"
-        self._should_compile_local_transformer = not self._use_dynamic_local_cache
+        self._should_compile_local_transformer = attn_impl not in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+        self._use_dynamic_local_cache = not self._should_compile_local_transformer
         self._compiled_local_transformer = None
 
     @property

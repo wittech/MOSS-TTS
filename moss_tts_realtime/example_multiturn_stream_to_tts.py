@@ -124,13 +124,30 @@ def run_streaming_tts(
     codebook_size = int(getattr(codec.config, "codebook_size", 1024))
     audio_eos_token = int(getattr(session.inferencer, "audio_eos_token", 1026))
 
+    # 首包时延计时
+    first_frame_time = None
+    start_time = time.perf_counter()
+
     with codec.streaming(batch_size=1):
         for delta in text_deltas:
             print(delta, end="", flush=True)
             audio_frames = session.push_text(delta)
+            # 检测是否为首帧输出
+            if first_frame_time is None:
+                for frame in audio_frames:
+                    if frame is not None and frame.numel() > 0:
+                        first_frame_time = time.perf_counter() - start_time
+                        print(f"\n[首包时延] {first_frame_time*1000:.2f} ms")
+                        break
             yield from decode_audio_frames(audio_frames, decoder, codebook_size, audio_eos_token)
 
         audio_frames = session.end_text()
+        if first_frame_time is None:
+            for frame in audio_frames:
+                if frame is not None and frame.numel() > 0:
+                    first_frame_time = time.perf_counter() - start_time
+                    print(f"\n[首包时延] {first_frame_time*1000:.2f} ms")
+                    break
         yield from decode_audio_frames(audio_frames, decoder, codebook_size, audio_eos_token)
 
         while True:
@@ -249,6 +266,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    # ========== H200 极致优化 ==========
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # BF16 降低精度优化（较新 PyTorch 版本支持）
+    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_fp16_reduced_precision_reduction'):
+        torch.backends.cuda.matmul.allow_bf16_fp16_reduced_precision_reduction = True
+
     args = build_arg_parser().parse_args()
     if args.repetition_window is not None and int(args.repetition_window) <= 0:
         args.repetition_window = None

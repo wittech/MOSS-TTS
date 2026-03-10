@@ -966,7 +966,7 @@ def main():
         "--attn_implementation",
         type=str,
         default="sdpa",
-        choices=["sdpa", "flash_attention_2", "eager", "none"],
+        choices=["sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "eager", "none"],
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8082)

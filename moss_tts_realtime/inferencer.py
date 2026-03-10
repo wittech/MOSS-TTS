@@ -84,7 +84,7 @@ class MossTTSRealtimeInference:
         self.codec = codec
         self.codec_sample_rate = int(codec_sample_rate)
         self.codec_encode_kwargs = codec_encode_kwargs or {"chunk_duration": 8}
-        self._use_dynamic_local_cache = self.model.config._attn_implementation == "flash_attention_2"
+        self._use_dynamic_local_cache = self.model.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
     @property
     def device(self) -> torch.device:
