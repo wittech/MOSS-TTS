@@ -42,6 +42,7 @@ def _load_bridge(lib_path: Path):
     lib.bridge_create.argtypes = [
         ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32,
         ctypes.c_int32, ctypes.c_int32,
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
     ]
     lib.bridge_create.restype = ctypes.c_void_p
 
@@ -78,6 +79,40 @@ def _load_bridge(lib_path: Path):
     return lib
 
 
+GGML_TYPE_MAP: dict[str, int] = {
+    "f32": 0, "f16": 1, "q4_0": 2, "q4_1": 3, "q5_0": 6, "q5_1": 7,
+    "q8_0": 8, "q8_1": 9, "q4_k": 12, "q5_k": 13, "q8_k": 15, "bf16": 30,
+}
+
+FLASH_ATTN_MAP: dict[str | bool, int] = {
+    "auto": -1, "disabled": 0, False: 0, "enabled": 1, True: 1,
+}
+
+
+def _resolve_ggml_type(name: str) -> int:
+    """Map a human-readable type name (e.g. 'q8_0') to its ggml_type int."""
+    key = name.strip().lower()
+    if key in GGML_TYPE_MAP:
+        return GGML_TYPE_MAP[key]
+    raise ValueError(
+        f"Unknown ggml type {name!r}. "
+        f"Valid options: {', '.join(sorted(GGML_TYPE_MAP))}"
+    )
+
+
+def _resolve_flash_attn(value: str | bool) -> int:
+    """Map flash_attn config value to llama_flash_attn_type int."""
+    if isinstance(value, bool):
+        return FLASH_ATTN_MAP[value]
+    key = value.strip().lower()
+    if key in FLASH_ATTN_MAP:
+        return FLASH_ATTN_MAP[key]
+    raise ValueError(
+        f"Unknown flash_attn value {value!r}. "
+        f"Valid options: auto, disabled, enabled, true, false"
+    )
+
+
 class LlamaCppBackbone:
     """Wrapper around the Qwen3 backbone running in llama.cpp.
 
@@ -92,15 +127,26 @@ class LlamaCppBackbone:
         n_batch: int = 512,
         n_threads: int = 4,
         n_gpu_layers: int = -1,
+        type_k: str = "f16",
+        type_v: str = "f16",
+        flash_attn: str | bool = "auto",
     ):
         lib_path = _find_bridge_lib()
         log.info("Loading bridge from %s", lib_path)
         self._lib = _load_bridge(lib_path)
 
+        ggml_type_k = _resolve_ggml_type(type_k)
+        ggml_type_v = _resolve_ggml_type(type_v)
+        fa_type = _resolve_flash_attn(flash_attn)
+
         model_path = str(Path(model_path).resolve())
-        log.info("Loading GGUF model: %s", model_path)
+        log.info(
+            "Loading GGUF model: %s (type_k=%s, type_v=%s, flash_attn=%s)",
+            model_path, type_k, type_v, flash_attn,
+        )
         self._handle = self._lib.bridge_create(
             model_path.encode("utf-8"), n_ctx, n_batch, n_threads, n_gpu_layers,
+            ggml_type_k, ggml_type_v, fa_type,
         )
         if not self._handle:
             raise RuntimeError(f"Failed to load model from {model_path}")

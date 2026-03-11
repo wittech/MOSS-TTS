@@ -1,6 +1,10 @@
 # Architecture: Global Latent + Local Transformer (MossTTSLocal)
 
-This document details the **MossTTSLocal** architecture, a flagship variant of the MOSS-TTS family. It utilizes a hierarchical autoregressive framework consisting of a **Global Transformer (Temporal)** and a **Local Transformer (Depth)** to achieve high-fidelity, controllable speech synthesis.
+This document details the **MossTTSLocal** architecture, a flagship variant of the MOSS-TTS family. It utilizes a hierarchical autoregressive framework consisting of a **Global Transformer (Temporal)** and a **Local Transformer (Depth)** to achieve high-fidelity, controllable speech synthesis. The architecture diagram is shown in the figure.
+
+<p align="center">
+  <img src="../assets/archi_local.png" width="60%" />
+</p>
 
 ---
 

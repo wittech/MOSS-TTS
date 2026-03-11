@@ -195,9 +195,26 @@ class MossTTSDelayProcessor(ProcessorMixin):
         trust_remote_code = kwargs.pop("trust_remote_code", True)
         kwargs.pop("_from_auto", None)
 
-        audio_tokenizer_name_or_path = kwargs.pop(
-            "codec_path", "OpenMOSS-Team/MOSS-Audio-Tokenizer"
-        )
+        audio_tokenizer_name_or_path = kwargs.pop("codec_path", None)
+        if audio_tokenizer_name_or_path is None:
+            processor_lookup_kwargs = dict(kwargs)
+            try:
+                processor_dict, _ = cls.get_processor_dict(
+                    pretrained_model_name_or_path,
+                    **processor_lookup_kwargs,
+                )
+                audio_tokenizer_name_or_path = processor_dict.get(
+                    "audio_tokenizer_name_or_path"
+                )
+                audio_tokenizer_dict = processor_dict.get("audio_tokenizer", {})
+                if isinstance(audio_tokenizer_dict, dict):
+                    audio_tokenizer_name_or_path = audio_tokenizer_dict.get(
+                        "audio_tokenizer_name_or_path"
+                    ) or audio_tokenizer_name_or_path
+            except Exception:
+                audio_tokenizer_name_or_path = None
+        if audio_tokenizer_name_or_path is None:
+            audio_tokenizer_name_or_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
 
         pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
         model_config = cast(
@@ -243,7 +260,7 @@ class MossTTSDelayProcessor(ProcessorMixin):
         mode only works when a Message is converted to a dict.
         """
 
-        if mode not in {"generation", "continuation"}:
+        if mode not in {"generation", "continuation", "computing_loss"}:
             raise RuntimeError
 
         if isinstance(conversations, (Message, Dict)):

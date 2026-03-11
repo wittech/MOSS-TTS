@@ -34,6 +34,7 @@ MOSS‑TTS 家族是由 [MOSI.AI](https://mosi.cn/#hero) 与 [OpenMOSS 团队](h
 
 <a id="news"></a>
 ## 新闻
+* 2026.3.10：⚡️ 大幅优化了 llama.cpp 推理管线的显存占用。现在 8B 模型可以运行在 8GB 显存的 GPU 上！
 * 2026.3.4：新增 **无 PyTorch 推理** 支持 — 通过 [llama.cpp](https://github.com/ggerganov/llama.cpp) + ONNX Runtime 实现端侧轻量部署。量化 GGUF 权重发布于 [`OpenMOSS-Team/MOSS-TTS-GGUF`](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-GGUF)，ONNX 音频编解码器发布于 [`OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX`](https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX)。详见 [llama.cpp 后端](#llamacpp-后端无-pytorch-推理)。
 * 2026.3.4：🎉 我们在 🦞 龙虾 的 [ClawHub](https://clawhub.ai) 平台上架了 MOSS-TTS skills：[feishu-voice-tts](https://clawhub.ai/helloeveryworlds/feishu-voice-tts) 与 [moss-tts-voice](https://clawhub.ai/luogao2333/moss-tts-voice)。
 * 2026.2.10：🎉🎉🎉 我们已发布 [MOSS-TTS Family](https://huggingface.co/collections/OpenMOSS-Team/moss-tts)。更多详情请查看我们的 [Blog](https://mosi.cn/#models)！我们的 Huggingface Space 在这里：[MOSS-TTS](https://huggingface.co/spaces/OpenMOSS-Team/MOSS-TTS), [MOSS-TTSD-v1.0](https://huggingface.co/spaces/OpenMOSS-Team/MOSS-TTSD-v1.0), [MOSS-VoiceGenerator](https://huggingface.co/spaces/OpenMOSS-Team/MOSS-VoiceGenerator).
@@ -56,6 +57,7 @@ MOSS‑TTS 家族是由 [MOSI.AI](https://mosi.cn/#hero) 与 [OpenMOSS 团队](h
   - [环境准备](#environment-setup)
   - [（可选）安装 FlashAttention 2](#optional-install-flashattention-2)
   - [基础用法](#moss-tts-basic-usage)
+  - [微调](#fine-tuning)
 - [llama.cpp 后端（无 PyTorch 推理）](#llamacpp-后端无-pytorch-推理)
 - [评测](#evaluation)
   - [MOSS-TTS 评测](#eval-moss-tts)
@@ -112,7 +114,7 @@ MOSS‑TTS 家族是由 [MOSI.AI](https://mosi.cn/#hero) 与 [OpenMOSS 团队](h
 
 ## 支持的语言
 
-MOSS-TT、MOSS-TTSD 和 MOSS-TTS-Realtime 目前支持 **20 种语言**：
+MOSS-TTS、MOSS-TTSD 和 MOSS-TTS-Realtime 目前支持 **20 种语言**：
 
 | Language | Code | Flag | Language | Code | Flag | Language | Code | Flag |
 |---|---|---|---|---|---|---|---|---|
@@ -329,6 +331,16 @@ with torch.no_grad():
 
 各模型的完整使用方式请参考对应的 model card。
 
+<a id="fine-tuning"></a>
+### 微调
+
+微调教程按架构分别组织。
+
+当前已提供：
+
+- `MossTTSDelay` / `OpenMOSS-Team/MOSS-TTS`：见 [moss_tts_delay/finetuning/README_zh.md](moss_tts_delay/finetuning/README_zh.md)
+
+后续其余架构的微调教程也会分别补充到对应目录下。
 
 ## llama.cpp 后端（无 PyTorch 推理）
 
@@ -353,6 +365,11 @@ cd moss_tts_delay/llama_cpp && bash build_bridge.sh /path/to/llama.cpp && cd ../
 python -m moss_tts_delay.llama_cpp \
     --config configs/llama_cpp/default.yaml \
     --text "你好世界！" --output output.wav
+
+# 6. (可选) 针对 8 GB 显存 GPU 的低显存模式 — 按阶段加载/卸载组件
+python -m moss_tts_delay.llama_cpp \
+    --config configs/llama_cpp/trt-8gb.yaml \
+    --text "你好世界！" --output output.wav
 ```
 
 ### 安装方案
@@ -376,15 +393,19 @@ python -m moss_tts_delay.llama_cpp \
 
 ### 配置
 
-`configs/llama_cpp/` 中提供了三个预设配置：
+`configs/llama_cpp/` 中提供了四个预设配置：
 
 - `default.yaml` — ONNX 音频 Tokenizer + GGUF backbone（推荐入门）
 - `trt.yaml` — TensorRT 音频 Tokenizer + GGUF backbone（最大吞吐，需自行编译 engine）
+- `trt-8gb.yaml` — 针对 8 GB 显存 GPU 的低显存模式（分阶段加载，TRT 音频）
 - `cpu-only.yaml` — 纯 CPU 运行（无需 GPU）
 
 关键配置项：
 - `heads_backend: auto | numpy | torch` — LM heads 计算后端
 - `audio_backend: onnx | trt | torch` — 音频编解码器后端
+- `low_memory: true | false` — 针对有限显存的分阶段加载（按阶段加载/卸载 encoder, backbone, decoder）
+- `kv_cache_type_k / kv_cache_type_v` — KV cache 量化（例如 `q8_0`, `q4_0`）以减少显存占用
+- `flash_attn: auto | enabled | disabled` — flash attention 用于降低 prefill 阶段的峰值显存
 
 完整文档请查看 [moss_tts_delay/llama_cpp/README.md](moss_tts_delay/llama_cpp/README.md)。
 

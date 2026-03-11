@@ -9,13 +9,22 @@ Ties together all components:
   - Delay state machine + sampling (NumPy)
   - Audio tokenizer (ONNX / TRT / Torch, configurable)
 
+Supports two modes controlled by ``low_memory`` in the config:
+  - **Normal** (``low_memory: false``): all components resident in GPU memory
+    for maximum throughput and real-time streaming.
+  - **Low-memory** (``low_memory: true``): loads/unloads GPU-heavy components
+    per stage (encode → generate → decode) so that peak VRAM equals
+    ``max(encoder, backbone, decoder)`` instead of their sum.
+
 Usage::
 
     python -m moss_tts_delay.llama_cpp --config configs/llama_cpp/default.yaml --text "Hello, world!"
+    python -m moss_tts_delay.llama_cpp --config configs/llama_cpp/trt-8gb.yaml --text "Hello, world!"
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from dataclasses import dataclass, fields
@@ -33,6 +42,7 @@ from .delay_state import (
     extract_audio_segments,
 )
 from .embedding import EmbeddingLookup
+from .gpu_monitor import GpuMonitor
 from .processor import Tokenizer, build_generation_prompt, parse_generation_output
 
 log = logging.getLogger(__name__)
@@ -64,6 +74,130 @@ def _detect_torch() -> bool:
         return torch.cuda.is_available()
     except ImportError:
         return False
+
+
+def _gpu_gc():
+    """Force garbage collection and release GPU caches."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# One-shot encoder / decoder wrappers  (low-memory mode only)
+# ---------------------------------------------------------------------------
+
+def _load_trt_encoder(engine_path: str):
+    from moss_audio_tokenizer.trt.inference import (
+        _TensorRTEngine, DOWNSAMPLE_RATE, N_QUANTIZERS,
+    )
+    engine = _TensorRTEngine(engine_path)
+    ins = [i.name for i in engine.get_inputs()]
+    outs = [o.name for o in engine.get_outputs()]
+
+    class _Enc:
+        def encode(self, waveform, n_quantizers=N_QUANTIZERS):
+            if waveform.ndim == 1:
+                waveform = waveform[np.newaxis, np.newaxis, :]
+            elif waveform.ndim == 2:
+                waveform = waveform[np.newaxis, :]
+            T = waveform.shape[-1]
+            padded = ((T + DOWNSAMPLE_RATE - 1) // DOWNSAMPLE_RATE) * DOWNSAMPLE_RATE
+            if padded != T:
+                waveform = np.concatenate(
+                    [waveform, np.zeros((1, 1, padded - T), dtype=np.float32)], axis=-1,
+                )
+            waveform = waveform.astype(np.float32)
+            nq = np.array(n_quantizers, dtype=np.int64)
+            r = engine.run(outs, {ins[0]: waveform, ins[1]: nq})
+            return r[0][:, 0, :int(r[1][0])].T.astype(np.int64)
+
+        def close(self):
+            engine.close()
+
+    return _Enc()
+
+
+def _load_trt_decoder(engine_path: str):
+    from moss_audio_tokenizer.trt.inference import _TensorRTEngine, N_QUANTIZERS
+    engine = _TensorRTEngine(engine_path)
+    ins = [i.name for i in engine.get_inputs()]
+    outs = [o.name for o in engine.get_outputs()]
+
+    class _Dec:
+        def decode(self, audio_codes, n_quantizers=N_QUANTIZERS):
+            if audio_codes.ndim == 2:
+                if audio_codes.shape[1] == N_QUANTIZERS and audio_codes.shape[0] != N_QUANTIZERS:
+                    audio_codes = audio_codes.T
+                audio_codes = audio_codes[:, np.newaxis, :]
+            codes = audio_codes.astype(np.int64)
+            nq = np.array(n_quantizers, dtype=np.int64)
+            r = engine.run(outs, {ins[0]: codes, ins[1]: nq})
+            return r[0][0, 0, :int(r[1][0])].astype(np.float32)
+
+        def close(self):
+            engine.close()
+
+    return _Dec()
+
+
+def _load_onnx_encoder(onnx_path: str, use_gpu: bool):
+    from moss_audio_tokenizer.onnx.inference import (
+        _load_ort_session, DOWNSAMPLE_RATE, N_QUANTIZERS,
+    )
+    session = _load_ort_session(onnx_path, use_gpu)
+    ins = [i.name for i in session.get_inputs()]
+    outs = [o.name for o in session.get_outputs()]
+
+    class _Enc:
+        def encode(self, waveform, n_quantizers=N_QUANTIZERS):
+            if waveform.ndim == 1:
+                waveform = waveform[np.newaxis, np.newaxis, :]
+            elif waveform.ndim == 2:
+                waveform = waveform[np.newaxis, :]
+            T = waveform.shape[-1]
+            padded = ((T + DOWNSAMPLE_RATE - 1) // DOWNSAMPLE_RATE) * DOWNSAMPLE_RATE
+            if padded != T:
+                waveform = np.concatenate(
+                    [waveform, np.zeros((1, 1, padded - T), dtype=np.float32)], axis=-1,
+                )
+            waveform = waveform.astype(np.float32)
+            nq = np.array(n_quantizers, dtype=np.int64)
+            r = session.run(outs, {ins[0]: waveform, ins[1]: nq})
+            return r[0][:, 0, :int(r[1][0])].T.astype(np.int64)
+
+        def close(self):
+            pass
+
+    return _Enc()
+
+
+def _load_onnx_decoder(onnx_path: str, use_gpu: bool):
+    from moss_audio_tokenizer.onnx.inference import _load_ort_session, N_QUANTIZERS
+    session = _load_ort_session(onnx_path, use_gpu)
+    ins = [i.name for i in session.get_inputs()]
+    outs = [o.name for o in session.get_outputs()]
+
+    class _Dec:
+        def decode(self, audio_codes, n_quantizers=N_QUANTIZERS):
+            if audio_codes.ndim == 2:
+                if audio_codes.shape[1] == N_QUANTIZERS and audio_codes.shape[0] != N_QUANTIZERS:
+                    audio_codes = audio_codes.T
+                audio_codes = audio_codes[:, np.newaxis, :]
+            codes = audio_codes.astype(np.int64)
+            nq = np.array(n_quantizers, dtype=np.int64)
+            r = session.run(outs, {ins[0]: codes, ins[1]: nq})
+            return r[0][0, 0, :int(r[1][0])].astype(np.float32)
+
+        def close(self):
+            pass
+
+    return _Dec()
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +235,12 @@ class PipelineConfig:
     n_gpu_layers: int = -1
     max_new_tokens: int = 2000
     use_gpu_audio: bool = True
+    low_memory: bool = False
+
+    # -- KV cache / attention --
+    kv_cache_type_k: str = "f16"
+    kv_cache_type_v: str = "f16"
+    flash_attn: str = "auto"
 
     # -- sampling --
     text_temperature: float = 1.5
@@ -173,6 +313,11 @@ class PipelineConfig:
             raise ValueError(
                 f"heads_backend must be 'auto', 'numpy', or 'torch', got {self.heads_backend!r}"
             )
+        if self.low_memory and self.audio_backend == "torch":
+            raise ValueError(
+                "low_memory mode requires audio_backend='trt' or 'onnx' "
+                "(the torch audio backend does not support split encoder/decoder loading)"
+            )
 
         checks = [
             ("backbone_gguf", self.backbone_gguf),
@@ -206,41 +351,23 @@ class PipelineConfig:
 # ---------------------------------------------------------------------------
 
 class LlamaCppPipeline:
-    """Full MOSS-TTS-Delay inference pipeline using llama.cpp backbone."""
+    """Full MOSS-TTS-Delay inference pipeline using llama.cpp backbone.
+
+    When ``config.low_memory`` is True, GPU-heavy components (backbone,
+    audio encoder, audio decoder) are loaded and freed per stage so that
+    peak VRAM ≈ max(encoder, backbone, decoder) instead of their sum.
+    """
 
     def __init__(self, config: PipelineConfig):
-        log.info("Initializing MOSS-TTS llama.cpp pipeline...")
         t0 = time.time()
-
         config.validate()
         self.config = config
+        self._low_memory = config.low_memory
         self._timings: dict[str, float | int] = {}
+        self._gpu_monitor = GpuMonitor(enabled=config.profile)
+        self._gpu_monitor.snapshot("before_init")
 
         self.tokenizer = Tokenizer(config.tokenizer_dir)
-        self.embedder = EmbeddingLookup(config.embedding_dir)
-
-        self.backbone = LlamaCppBackbone(
-            config.backbone_gguf,
-            n_ctx=config.n_ctx,
-            n_batch=config.n_batch,
-            n_threads=config.n_threads,
-            n_gpu_layers=config.n_gpu_layers,
-        )
-
-        # --- LM heads: torch or numpy ---
-        use_torch = self._resolve_heads_backend(config.heads_backend)
-        if use_torch:
-            from .lm_heads import TorchLMHeads
-            self.lm_heads = TorchLMHeads(config.lm_head_dir)
-            log.info("LM heads: TorchLMHeads (GPU-accelerated)")
-        else:
-            from .lm_heads import NumpyLMHeads
-            self.lm_heads = NumpyLMHeads(config.lm_head_dir)
-            log.info("LM heads: NumpyLMHeads (torch-free)")
-
-        # --- Audio tokenizer ---
-        self.audio_tokenizer = self._build_audio_tokenizer(config)
-
         self.sampling_config = SamplingConfig(
             text_temperature=config.text_temperature,
             text_top_p=config.text_top_p,
@@ -251,7 +378,35 @@ class LlamaCppPipeline:
             audio_repetition_penalty=config.audio_repetition_penalty,
         )
 
-        log.info("Pipeline initialized in %.2fs", time.time() - t0)
+        if self._low_memory:
+            self.backbone = None
+            self.embedder = None
+            self.lm_heads = None
+            self.audio_tokenizer = None
+            self._gpu_monitor.snapshot("after_init")
+            log.info("Low-memory pipeline ready (components loaded on demand)")
+        else:
+            self.embedder = EmbeddingLookup(config.embedding_dir)
+            self.backbone = LlamaCppBackbone(
+                config.backbone_gguf,
+                n_ctx=config.n_ctx,
+                n_batch=config.n_batch,
+                n_threads=config.n_threads,
+                n_gpu_layers=config.n_gpu_layers,
+                type_k=config.kv_cache_type_k,
+                type_v=config.kv_cache_type_v,
+                flash_attn=config.flash_attn,
+            )
+            self._gpu_monitor.snapshot("backbone_loaded")
+
+            self.lm_heads = self._build_lm_heads(config)
+            self._gpu_monitor.snapshot("lm_heads_loaded")
+
+            self.audio_tokenizer = self._build_audio_tokenizer(config)
+            self._gpu_monitor.snapshot("audio_tokenizer_loaded")
+            log.info("Pipeline initialized in %.2fs", time.time() - t0)
+
+    # ── Component factories ──────────────────────────────────────────────
 
     @staticmethod
     def _resolve_heads_backend(setting: str) -> bool:
@@ -261,6 +416,19 @@ class LlamaCppPipeline:
         if setting == "numpy":
             return False
         return _detect_torch()
+
+    @staticmethod
+    def _build_lm_heads(config: PipelineConfig):
+        use_torch = LlamaCppPipeline._resolve_heads_backend(config.heads_backend)
+        if use_torch:
+            from .lm_heads import TorchLMHeads
+            heads = TorchLMHeads(config.lm_head_dir)
+            log.info("LM heads: TorchLMHeads (GPU-accelerated)")
+        else:
+            from .lm_heads import NumpyLMHeads
+            heads = NumpyLMHeads(config.lm_head_dir)
+            log.info("LM heads: NumpyLMHeads (torch-free)")
+        return heads
 
     @staticmethod
     def _build_audio_tokenizer(config: PipelineConfig):
@@ -288,7 +456,19 @@ class LlamaCppPipeline:
             return _TorchAudioTokenizerWrapper(model, device=device)
         raise ValueError(f"Unknown audio_backend: {config.audio_backend!r}")
 
-    # ----- generation -----
+    def _load_encoder_only(self):
+        cfg = self.config
+        if cfg.audio_backend == "trt":
+            return _load_trt_encoder(cfg.audio_encoder_trt)
+        return _load_onnx_encoder(cfg.audio_encoder_onnx, cfg.use_gpu_audio)
+
+    def _load_decoder_only(self):
+        cfg = self.config
+        if cfg.audio_backend == "trt":
+            return _load_trt_decoder(cfg.audio_decoder_trt)
+        return _load_onnx_decoder(cfg.audio_decoder_onnx, cfg.use_gpu_audio)
+
+    # ── Generation ───────────────────────────────────────────────────────
 
     def generate(
         self,
@@ -305,10 +485,15 @@ class LlamaCppPipeline:
 
         Returns:
             waveform: float32 array at 24 kHz
+
+        When ``low_memory`` is enabled, real-time streaming is unavailable
+        because the audio decoder is not resident during generation.
+        The streaming callback receives the full waveform after decoding.
         """
         if max_new_tokens is None:
             max_new_tokens = self.config.max_new_tokens
 
+        # ── Stage 1: Encode reference audio ──
         ref_codes = self._prepare_reference(reference_audio)
 
         log.info("Building prompt for: %s", text[:80])
@@ -320,37 +505,53 @@ class LlamaCppPipeline:
         prompt_len = input_ids.shape[0]
         log.info("Prompt length: %d tokens", prompt_len)
 
-        n_ctx = self.backbone.n_ctx
-        if prompt_len >= n_ctx:
-            raise ValueError(
-                f"Prompt length ({prompt_len}) >= n_ctx ({n_ctx}). "
-                f"Either shorten the input/reference, or increase n_ctx."
+        # ── Stage 2: LLM generation ──
+        if self._low_memory:
+            backbone, embedder, lm_heads = self._load_llm_components()
+        else:
+            backbone, embedder, lm_heads = self.backbone, self.embedder, self.lm_heads
+
+        try:
+            n_ctx = backbone.n_ctx
+            if prompt_len >= n_ctx:
+                raise ValueError(
+                    f"Prompt length ({prompt_len}) >= n_ctx ({n_ctx}). "
+                    f"Either shorten the input/reference, or increase n_ctx."
+                )
+            if prompt_len > n_ctx - 100:
+                log.warning(
+                    "Prompt uses %d of %d context tokens — only %d left for generation",
+                    prompt_len, n_ctx, n_ctx - prompt_len,
+                )
+
+            backbone.clear_kv()
+
+            log.info("Prefilling %d tokens...", prompt_len)
+            t_prefill = time.time()
+            self._prefill(input_ids, backbone, embedder)
+            dt_prefill = time.time() - t_prefill
+            log.info("Prefill done in %.2fs", dt_prefill)
+            self._gpu_monitor.snapshot("after_prefill")
+
+            log.info("Generating (max %d steps)...", max_new_tokens)
+            t_gen = time.time()
+            generation_ids = self._autoregressive_loop(
+                input_ids, max_new_tokens, backbone, embedder, lm_heads,
+                streaming_callback=streaming_callback if not self._low_memory else None,
             )
-        if prompt_len > n_ctx - 100:
-            log.warning(
-                "Prompt uses %d of %d context tokens — only %d left for generation",
-                prompt_len, n_ctx, n_ctx - prompt_len,
+            gen_steps = generation_ids.shape[0] - prompt_len
+            dt_gen = time.time() - t_gen
+            log.info(
+                "Generated %d steps in %.2fs (%.1f tokens/sec)",
+                gen_steps, dt_gen, gen_steps / max(dt_gen, 1e-6),
             )
-
-        self.backbone.clear_kv()
-
-        log.info("Prefilling %d tokens...", prompt_len)
-        t_prefill = time.time()
-        self._prefill(input_ids)
-        dt_prefill = time.time() - t_prefill
-        log.info("Prefill done in %.2fs", dt_prefill)
-
-        log.info("Generating (max %d steps)...", max_new_tokens)
-        t_gen = time.time()
-        generation_ids = self._autoregressive_loop(
-            input_ids, max_new_tokens, streaming_callback,
-        )
-        gen_steps = generation_ids.shape[0] - prompt_len
-        dt_gen = time.time() - t_gen
-        log.info(
-            "Generated %d steps in %.2fs (%.1f tokens/sec)",
-            gen_steps, dt_gen, gen_steps / max(dt_gen, 1e-6),
-        )
+            self._gpu_monitor.snapshot("after_generation")
+        finally:
+            if self._low_memory:
+                backbone.close()
+                del backbone, embedder, lm_heads
+                _gpu_gc()
+                self._gpu_monitor.snapshot("llm_unloaded")
 
         _text, audio_codes = parse_generation_output(
             self.tokenizer, generation_ids, prompt_len,
@@ -361,30 +562,93 @@ class LlamaCppPipeline:
             log.warning("No audio codes generated")
             return np.zeros(0, dtype=np.float32)
 
+        # ── Stage 3: Decode audio ──
         log.info("Decoding %d audio frames to waveform...", audio_codes.shape[0])
         t_dec = time.time()
-        waveform = self.audio_tokenizer.decode(audio_codes)
+        if self._low_memory:
+            decoder = self._load_decoder_only()
+            self._gpu_monitor.snapshot("decoder_loaded")
+            try:
+                waveform = decoder.decode(audio_codes)
+            finally:
+                decoder.close()
+                del decoder
+                _gpu_gc()
+            self._gpu_monitor.snapshot("decoder_unloaded")
+        else:
+            waveform = self.audio_tokenizer.decode(audio_codes)
         dt_dec = time.time() - t_dec
+
         waveform = loudness_normalize(waveform)
         audio_secs = len(waveform) / SAMPLE_RATE
         log.info("Output waveform: %.2fs (%d samples), decoded in %.2fs", audio_secs, len(waveform), dt_dec)
+        if not self._low_memory:
+            self._gpu_monitor.snapshot("after_audio_decode")
+
+        if self._low_memory and streaming_callback is not None:
+            streaming_callback(waveform)
 
         if self.config.profile:
             self._print_profile(prompt_len, gen_steps, dt_prefill, dt_gen, dt_dec, audio_secs)
 
         return waveform
 
+    def _load_llm_components(self):
+        """Load backbone + embeddings + LM heads (low-memory mode)."""
+        cfg = self.config
+        log.info("[low-memory] Loading LLM components...")
+        t0 = time.time()
+
+        backbone = LlamaCppBackbone(
+            cfg.backbone_gguf,
+            n_ctx=cfg.n_ctx,
+            n_batch=cfg.n_batch,
+            n_threads=cfg.n_threads,
+            n_gpu_layers=cfg.n_gpu_layers,
+            type_k=cfg.kv_cache_type_k,
+            type_v=cfg.kv_cache_type_v,
+            flash_attn=cfg.flash_attn,
+        )
+        self._gpu_monitor.snapshot("backbone_loaded")
+
+        try:
+            embedder = EmbeddingLookup(cfg.embedding_dir)
+            lm_heads = self._build_lm_heads(cfg)
+        except Exception:
+            backbone.close()
+            raise
+        self._gpu_monitor.snapshot("llm_loaded")
+
+        log.info("[low-memory] LLM loaded in %.2fs", time.time() - t0)
+        return backbone, embedder, lm_heads
+
     def _prepare_reference(self, reference) -> np.ndarray | None:
         if reference is None:
             return None
 
+        wav = self._load_reference_wav(reference)
+
+        if self._low_memory:
+            log.info("[low-memory] Loading encoder for reference encoding...")
+            encoder = self._load_encoder_only()
+            self._gpu_monitor.snapshot("encoder_loaded")
+            try:
+                ref_codes = encoder.encode(wav)
+            finally:
+                encoder.close()
+                del encoder
+                _gpu_gc()
+            self._gpu_monitor.snapshot("encoder_unloaded")
+            return ref_codes
+
+        return self.audio_tokenizer.encode(wav)
+
+    def _load_reference_wav(self, reference) -> np.ndarray:
+        """Load and normalize reference audio to a float32 waveform."""
         if isinstance(reference, np.ndarray):
-            if reference.ndim == 2 and reference.shape[1] == N_VQ:
-                return reference
             if reference.ndim == 1 or (reference.ndim == 2 and reference.shape[0] == 1):
                 wav = reference.ravel().astype(np.float32)
-                wav = loudness_normalize(wav)
-                return self.audio_tokenizer.encode(wav)
+                return loudness_normalize(wav)
             raise ValueError(f"Unexpected reference shape: {reference.shape}")
 
         if isinstance(reference, (str, Path)):
@@ -401,20 +665,26 @@ class LlamaCppPipeline:
                         f"Reference audio is {sr}Hz, need {SAMPLE_RATE}Hz. "
                         f"Install librosa for resampling: pip install librosa"
                     )
-            wav = loudness_normalize(wav)
-            return self.audio_tokenizer.encode(wav)
+            return loudness_normalize(wav)
 
         raise TypeError(f"Unsupported reference type: {type(reference)}")
 
-    def _prefill(self, input_ids: np.ndarray) -> None:
-        embeds = self.embedder(input_ids[np.newaxis, :, :])
-        embeds = embeds[0]
-        self.backbone.decode_batch(embeds, pos_start=0, output_last=True)
+    @staticmethod
+    def _prefill(
+        input_ids: np.ndarray,
+        backbone: LlamaCppBackbone,
+        embedder: EmbeddingLookup,
+    ) -> None:
+        embeds = embedder(input_ids[np.newaxis, :, :])[0]
+        backbone.decode_batch(embeds, pos_start=0, output_last=True)
 
     def _autoregressive_loop(
         self,
         input_ids: np.ndarray,
         max_new_tokens: int,
+        backbone: LlamaCppBackbone,
+        embedder: EmbeddingLookup,
+        lm_heads,
         streaming_callback=None,
     ) -> np.ndarray:
         prompt_len = input_ids.shape[0]
@@ -434,19 +704,18 @@ class LlamaCppPipeline:
         step_idx = -1
         for step_idx in range(max_new_tokens):
             t0 = time.time()
-            text_logits = self.backbone.get_logits(-1)
-            hs = self.backbone.get_hidden_state(-1)
+            text_logits = backbone.get_logits(-1)
+            hs = backbone.get_hidden_state(-1)
             t1 = time.time()
 
-            audio_logits = self.lm_heads.audio_all(hs)
+            audio_logits = lm_heads.audio_all(hs)
             t2 = time.time()
 
             next_ids = delay_step(state, text_logits, audio_logits, self.sampling_config)
             t3 = time.time()
 
-            embd = self.embedder(next_ids[np.newaxis, :])
-            embd = embd[0]
-            self.backbone.decode_single(embd, pos=pos, output=True)
+            embd = embedder(next_ids[np.newaxis, :])[0]
+            backbone.decode_single(embd, pos=pos, output=True)
             t4 = time.time()
 
             if profile:
@@ -503,9 +772,10 @@ class LlamaCppPipeline:
     ) -> None:
         total = dt_prefill + dt_gen + dt_dec
         rtf = total / max(audio_secs, 1e-6)
+        mode_label = "LOW-MEMORY" if self._low_memory else "NORMAL"
 
-        print("\n" + "=" * 60)
-        print("  PROFILING SUMMARY")
+        print(f"\n{'=' * 60}")
+        print(f"  PROFILING SUMMARY  ({mode_label})")
         print("=" * 60)
         print(f"  Prompt tokens:        {prompt_len}")
         print(f"  Generated steps:      {gen_steps}")
@@ -536,11 +806,17 @@ class LlamaCppPipeline:
             if abs(drift) > 0.5:
                 print(f"    {'drift_ms':30s} {drift:8.2f}  (untracked overhead)")
 
+        if self._gpu_monitor.enabled and self._gpu_monitor.snapshots:
+            print()
+            print("  GPU VRAM (device-level, via pynvml):")
+            print(self._gpu_monitor.format_summary())
+
         print("=" * 60 + "\n")
 
     def close(self):
-        self.backbone.close()
-        if hasattr(self.audio_tokenizer, "close"):
+        if self.backbone is not None:
+            self.backbone.close()
+        if self.audio_tokenizer is not None and hasattr(self.audio_tokenizer, "close"):
             self.audio_tokenizer.close()
 
     def __enter__(self):
@@ -600,8 +876,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  # Basic generation:
+  # Normal (all-resident) generation:
   python -m moss_tts_delay.llama_cpp --config configs/llama_cpp/default.yaml --text "Hello!"
+
+  # Low-memory (staged) generation for small GPUs:
+  python -m moss_tts_delay.llama_cpp --config configs/llama_cpp/trt-8gb.yaml --text "Hello!"
 
   # With reference audio + profiling:
   python -m moss_tts_delay.llama_cpp --config configs/llama_cpp/default.yaml \\
@@ -629,6 +908,8 @@ examples:
     parser.add_argument("--audio-rep-penalty", type=float, default=None)
     parser.add_argument("--n-gpu-layers", type=int, default=None)
     parser.add_argument("--heads-backend", choices=["auto", "numpy", "torch"], default=None)
+    parser.add_argument("--low-memory", action="store_true",
+                        help="Enable low-memory mode (override config)")
     parser.add_argument("--profile", action="store_true")
 
     args = parser.parse_args()
@@ -646,6 +927,8 @@ examples:
         config.n_gpu_layers = args.n_gpu_layers
     if args.heads_backend is not None:
         config.heads_backend = args.heads_backend
+    if args.low_memory:
+        config.low_memory = True
     if args.profile:
         config.profile = True
 

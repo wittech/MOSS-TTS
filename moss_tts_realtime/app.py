@@ -1,39 +1,57 @@
-import os
 import argparse
 import base64
 import functools
 import json
 import sys
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
+from typing import Iterator, Sequence
 
 import gradio as gr
 import numpy as np
 
 import torch
 import torchaudio
-
-from transformers import AutoTokenizer, AutoModel
+import torch._dynamo
+from transformers import AutoModel, AutoTokenizer
 from mossttsrealtime import MossTTSRealtime, MossTTSRealtimeProcessor
 from mossttsrealtime.streaming_mossttsrealtime import (
     AudioStreamDecoder,
     MossTTSRealtimeInference,
     MossTTSRealtimeStreamingSession,
 )
-import torch._dynamo
+
 torch._dynamo.config.cache_size_limit = 64
 
+APP_DIR = Path(__file__).resolve().parent
+AUDIO_DIR = APP_DIR / "audio"
 SAMPLE_RATE = 24000
+
 CODEC_MODEL_PATH = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
-MODEL_PATH = (
-    "OpenMOSS-Team/MOSS-TTS-Realtime"
-)
+MODEL_PATH = "OpenMOSS-Team/MOSS-TTS-Realtime"
 TOKENIZER_PATH = "OpenMOSS-Team/MOSS-TTS-Realtime"
-PROMPT_WAV = "./audio/prompt_audio1.mp3"
-USER_WAV = "./audio/user1.wav"
+
+PROMPT_WAV = AUDIO_DIR / "prompt_audio1.mp3"
+USER_WAV = AUDIO_DIR / "user1.wav"
+
+WARMUP_POLL_INTERVAL_SECONDS = 0.5
+DEFAULT_REPETITION_WINDOW = 50
+WARMUP_STEP_TOKENS = DEFAULT_REPETITION_WINDOW + 1
+WARMUP_USER_TEXT = "Hello!"
+WARMUP_BASE_ASSISTANT_TEXT = (
+    "This startup warmup request primes the streaming text to speech path "
+    "so the first real user request avoids the cold compile stall."
+)
+
+
+def _apply_seed(seed: int | None) -> None:
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def _load_audio(path: Path, target_sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
@@ -106,14 +124,6 @@ class StreamingConfig:
 
 
 @dataclass(frozen=True)
-class StreamingCallbacks:
-    on_text_stream_start: Callable[[], None] | None = None
-    on_text_stream_stop: Callable[[], None] | None = None
-    on_audio_stream_start: Callable[[], None] | None = None
-    on_audio_stream_stop: Callable[[], None] | None = None
-
-
-@dataclass(frozen=True)
 class StreamingRequest:
     user_text: str
     assistant_text: str
@@ -132,32 +142,38 @@ class StreamEvent:
     audio: tuple[int, np.ndarray] | None = None
 
 
+@dataclass(frozen=True)
+class WarmupSnapshot:
+    state: str
+    progress: float
+    message: str
+    detail: str | None = None
+    error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready"
+
+    @property
+    def failed(self) -> bool:
+        return self.state == "failed"
+
+
 class TokenChunkStream:
     def __init__(
         self,
         tokens: Sequence[int],
         chunk_size: int,
-        callbacks: StreamingCallbacks | None = None,
     ):
         self._tokens = list(tokens)
         self._chunk_size = int(chunk_size)
-        self._callbacks = callbacks
 
     def __iter__(self) -> Iterator[list[int]]:
         if not self._tokens:
             return
-        started = False
-        try:
-            step = len(self._tokens) if self._chunk_size <= 0 else self._chunk_size
-            for idx in range(0, len(self._tokens), step):
-                if not started:
-                    started = True
-                    if self._callbacks and self._callbacks.on_text_stream_start:
-                        self._callbacks.on_text_stream_start()
-                yield self._tokens[idx : idx + step]
-        finally:
-            if started and self._callbacks and self._callbacks.on_text_stream_stop:
-                self._callbacks.on_text_stream_stop()
+        step = len(self._tokens) if self._chunk_size <= 0 else self._chunk_size
+        for idx in range(0, len(self._tokens), step):
+            yield self._tokens[idx : idx + step]
 
 
 class BufferedAudioTracker:
@@ -187,28 +203,10 @@ class AudioFrameDecoder:
         decoder: AudioStreamDecoder,
         codebook_size: int,
         audio_eos_token: int,
-        callbacks: StreamingCallbacks | None = None,
     ):
         self.decoder = decoder
         self.codebook_size = codebook_size
         self.audio_eos_token = audio_eos_token
-        self.callbacks = callbacks or StreamingCallbacks()
-        self._started = False
-        self._finished = False
-
-    def _mark_started(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        if self.callbacks.on_audio_stream_start:
-            self.callbacks.on_audio_stream_start()
-
-    def finish(self) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        if self._started and self.callbacks.on_audio_stream_stop:
-            self.callbacks.on_audio_stream_stop()
 
     def decode_frames(self, audio_frames: list[torch.Tensor]) -> Iterator[np.ndarray]:
         for frame in audio_frames:
@@ -217,22 +215,80 @@ class AudioFrameDecoder:
                 tokens = tokens[0]
             if tokens.dim() != 2:
                 raise ValueError(f"Expected [T, C] audio tokens, got {tuple(tokens.shape)}")
-            tokens, _ = _sanitize_tokens(tokens, self.codebook_size, self.audio_eos_token)
+            tokens, stop = _sanitize_tokens(tokens, self.codebook_size, self.audio_eos_token)
             if tokens.numel() == 0:
+                if stop:
+                    break
                 continue
             self.decoder.push_tokens(tokens.detach())
             for wav in self.decoder.audio_chunks():
                 if wav.numel() == 0:
                     continue
-                self._mark_started()
                 yield wav.detach().cpu().numpy().reshape(-1)
+            if stop:
+                break
 
     def flush(self) -> Iterator[np.ndarray]:
         final_chunk = self.decoder.flush()
         if final_chunk is not None and final_chunk.numel() > 0:
-            self._mark_started()
             yield final_chunk.detach().cpu().numpy().reshape(-1)
-        self.finish()
+
+
+class StreamAudioEmitter:
+    def __init__(self, sample_rate: int, prebuffer_seconds: float):
+        self.sample_rate = sample_rate
+        self._buffer_tracker = BufferedAudioTracker(sample_rate)
+        self._prebuffer_target = max(0.0, float(prebuffer_seconds))
+        self._prebuffering = self._prebuffer_target > 0.0
+        self._pending_chunks: list[np.ndarray] = []
+        self._pending_samples = 0
+        self.chunk_count = 0
+        self.has_audio = False
+
+    def wait_for_capacity(self, threshold_seconds: float) -> None:
+        _maybe_wait_for_buffer(self._buffer_tracker, threshold_seconds)
+
+    def emit_many(self, chunks: Iterator[np.ndarray], message_prefix: str) -> Iterator[StreamEvent]:
+        for chunk in chunks:
+            yield from self.emit(chunk, message_prefix)
+
+    def emit(self, chunk: np.ndarray, message_prefix: str) -> Iterator[StreamEvent]:
+        chunk = np.asarray(chunk).reshape(-1)
+        if chunk.size == 0:
+            return
+        if self._prebuffering:
+            self._pending_chunks.append(chunk)
+            self._pending_samples += int(chunk.size)
+            if (self._pending_samples / self.sample_rate) < self._prebuffer_target:
+                return
+            self._prebuffering = False
+            pending_chunks = self._pending_chunks
+            self._pending_chunks = []
+            self._pending_samples = 0
+            for pending in pending_chunks:
+                yield self._make_event(pending, message_prefix)
+            return
+        yield self._make_event(chunk, message_prefix)
+
+    def flush(self, message_prefix: str) -> Iterator[StreamEvent]:
+        if not self._prebuffering or not self._pending_chunks:
+            self._prebuffering = False
+            return
+        self._prebuffering = False
+        pending_chunks = self._pending_chunks
+        self._pending_chunks = []
+        self._pending_samples = 0
+        for chunk in pending_chunks:
+            yield self._make_event(chunk, message_prefix)
+
+    def _make_event(self, chunk: np.ndarray, message_prefix: str) -> StreamEvent:
+        self.chunk_count += 1
+        self.has_audio = True
+        self._buffer_tracker.add_chunk(chunk)
+        return StreamEvent(
+            message=f"{message_prefix} chunk {self.chunk_count}",
+            audio=(self.sample_rate, chunk),
+        )
 
 
 def _maybe_wait_for_buffer(buffer_tracker: BufferedAudioTracker, threshold_seconds: float) -> None:
@@ -263,6 +319,91 @@ def _sanitize_tokens(
         tokens = tokens[:stop_idx]
         return tokens, True
     return tokens, False
+
+
+def _build_streaming_session(
+    model: MossTTSRealtime,
+    tokenizer,
+    processor: MossTTSRealtimeProcessor,
+    codec,
+    *,
+    max_length: int,
+    chunk_duration: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    do_sample: bool,
+    repetition_penalty: float,
+    repetition_window: int,
+) -> tuple[MossTTSRealtimeStreamingSession, MossTTSRealtimeInference]:
+    inferencer = MossTTSRealtimeInference(model, tokenizer, max_length=max_length)
+    inferencer.reset_generation_state(keep_cache=False)
+    session = MossTTSRealtimeStreamingSession(
+        inferencer,
+        processor,
+        codec=codec,
+        codec_sample_rate=SAMPLE_RATE,
+        codec_encode_kwargs={"chunk_duration": chunk_duration},
+        prefill_text_len=processor.delay_tokens_len,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        do_sample=do_sample,
+        repetition_penalty=repetition_penalty,
+        repetition_window=repetition_window,
+    )
+    return session, inferencer
+
+
+def _build_frame_decoder(
+    codec,
+    inferencer: MossTTSRealtimeInference,
+    device: torch.device,
+    *,
+    chunk_frames: int,
+    overlap_frames: int,
+) -> AudioFrameDecoder:
+    decoder = AudioStreamDecoder(
+        codec,
+        chunk_frames=chunk_frames,
+        overlap_frames=overlap_frames,
+        decode_kwargs={"chunk_duration": -1},
+        device=device,
+    )
+    return AudioFrameDecoder(
+        decoder,
+        int(getattr(codec, "codebook_size", 1024)),
+        int(getattr(inferencer, "audio_eos_token", 1026)),
+    )
+
+
+def _normalize_seed(value: float | int | None) -> int | None:
+    if value is None:
+        return None
+    seed = int(value)
+    return None if seed == 0 else seed
+
+
+def _format_completion_status(
+    chunk_count: int,
+    sample_rate: int,
+    full_audio: np.ndarray,
+    started_at: float,
+    first_chunk_time: float | None,
+) -> str:
+    elapsed = time.monotonic() - started_at
+    audio_seconds = float(full_audio.size) / float(sample_rate) if full_audio.size > 0 else 0.0
+    rtf = (elapsed / audio_seconds) if audio_seconds > 0 else float("inf")
+    parts = [
+        "Done",
+        f"chunks={chunk_count}",
+        f"audio={audio_seconds:.2f}s",
+        f"elapsed={elapsed:.2f}s",
+        f"RTF={rtf:.3f}" if np.isfinite(rtf) else "RTF=inf",
+    ]
+    if first_chunk_time is not None:
+        parts.append(f"TTFB={(first_chunk_time - started_at) * 1000.0:.0f}ms")
+    return " | ".join(parts)
 
 
 @functools.lru_cache(maxsize=1)
@@ -297,7 +438,7 @@ def _load_backend(
     return model, tokenizer, processor, codec, device
 
 
-def _resolve_audio_path(audio_path: str | None, use_default: bool, default_path: str) -> Path | None:
+def _resolve_audio_path(audio_path: str | None, use_default: bool, default_path: str | Path) -> Path | None:
     if audio_path:
         return Path(audio_path).expanduser()
     if use_default:
@@ -321,9 +462,15 @@ class StreamingTTSDemo:
 
     def _validate_request(self, request: StreamingRequest) -> tuple[Path | None, Path | None]:
         if not request.user_text.strip():
-            raise ValueError("assistant_text is required.")
+            raise ValueError("user_text is required.")
         if not request.assistant_text.strip():
             raise ValueError("assistant_text is required.")
+        if request.streaming.text_chunk_tokens <= 0:
+            raise ValueError("text_chunk_tokens must be greater than 0.")
+        if request.streaming.decode_chunk_frames <= 0:
+            raise ValueError("decode_chunk_frames must be greater than 0.")
+        if request.streaming.chunk_duration <= 0:
+            raise ValueError("chunk_duration must be greater than 0.")
 
         prompt_path = _resolve_audio_path(request.prompt_audio, request.use_default_prompt, PROMPT_WAV)
         user_path = _resolve_audio_path(request.user_audio, request.use_default_user, USER_WAV)
@@ -335,7 +482,13 @@ class StreamingTTSDemo:
 
         return prompt_path, user_path
 
-    def _encode_audio_tokens(self, path: Path, codec, device: torch.device, chunk_duration: float) -> np.ndarray:
+    def _encode_audio_tokens(
+        self,
+        path: Path,
+        codec,
+        device: torch.device,
+        chunk_duration: float,
+    ) -> np.ndarray:
         resolved_path = path.expanduser().resolve()
         cache_key = (str(resolved_path), int(resolved_path.stat().st_mtime_ns), float(chunk_duration))
         cached_tokens = self._audio_token_cache.get(cache_key)
@@ -380,32 +533,60 @@ class StreamingTTSDemo:
         user_prompt[:, 0] = np.asarray(user_prompt_tokens, dtype=np.int64)
         return np.concatenate([system_prompt, user_prompt], axis=0)
 
+    def _prepare_session_turn(
+        self,
+        session: MossTTSRealtimeStreamingSession,
+        processor: MossTTSRealtimeProcessor,
+        user_text: str,
+        prompt_tokens: np.ndarray | None,
+        user_tokens: np.ndarray | None,
+    ) -> str | None:
+        if user_tokens is None:
+            turn_input_ids = self._build_text_only_turn_input(processor, user_text, prompt_tokens)
+            session.reset_turn(input_ids=turn_input_ids, include_system_prompt=True, reset_cache=True)
+            return "No user audio provided, running text-only turn."
+
+        session.reset_turn(
+            user_text=user_text,
+            user_audio_tokens=user_tokens,
+            include_system_prompt=True,
+            reset_cache=True,
+        )
+        return None
+
     def run_stream(self, request: StreamingRequest) -> Iterator[StreamEvent]:
         prompt_path, user_path = self._validate_request(request)
         model, tokenizer, processor, codec, device = self.get_or_load_backend(request.backend)
+        _apply_seed(request.generation.seed)
 
-        if request.generation.seed is not None:
-            torch.manual_seed(request.generation.seed)
-            torch.cuda.manual_seed_all(request.generation.seed)
-
-        prompt_tokens: np.ndarray | None = None
-        user_tokens: np.ndarray | None = None
-        if prompt_path is not None:
-            prompt_tokens = self._encode_audio_tokens(
-                prompt_path, codec, device, chunk_duration=request.streaming.chunk_duration
+        prompt_tokens = (
+            self._encode_audio_tokens(
+                prompt_path,
+                codec,
+                device,
+                chunk_duration=request.streaming.chunk_duration,
             )
-        if user_path is not None:
-            user_tokens = self._encode_audio_tokens(user_path, codec, device, chunk_duration=request.streaming.chunk_duration)
+            if prompt_path is not None
+            else None
+        )
+        user_tokens = (
+            self._encode_audio_tokens(
+                user_path,
+                codec,
+                device,
+                chunk_duration=request.streaming.chunk_duration,
+            )
+            if user_path is not None
+            else None
+        )
 
-        inferencer = MossTTSRealtimeInference(model, tokenizer, max_length=request.generation.max_length)
-        inferencer.reset_generation_state(keep_cache=False)
-        session = MossTTSRealtimeStreamingSession(
-            inferencer,
+        session, inferencer = _build_streaming_session(
+            model,
+            tokenizer,
             processor,
-            codec=codec,
-            codec_sample_rate=SAMPLE_RATE,
-            codec_encode_kwargs={"chunk_duration": request.streaming.chunk_duration},
-            prefill_text_len=processor.delay_tokens_len,
+            codec,
+            max_length=request.generation.max_length,
+            chunk_duration=request.streaming.chunk_duration,
             temperature=request.generation.temperature,
             top_p=request.generation.top_p,
             top_k=request.generation.top_k,
@@ -413,121 +594,278 @@ class StreamingTTSDemo:
             repetition_penalty=request.generation.repetition_penalty,
             repetition_window=request.generation.repetition_window,
         )
-
         if prompt_tokens is not None:
             session.set_voice_prompt_tokens(prompt_tokens)
         else:
             session.clear_voice_prompt()
 
-        if user_tokens is None:
-            turn_input_ids = self._build_text_only_turn_input(processor, request.user_text, prompt_tokens)
-            session.reset_turn(input_ids=turn_input_ids, include_system_prompt=True, reset_cache=True)
-            yield StreamEvent(message="No user audio provided, running text-only turn.")
-        else:
-            session.reset_turn(
-                user_text=request.user_text,
-                user_audio_tokens=user_tokens,
-                include_system_prompt=True,
-                reset_cache=True,
-            )
+        turn_message = self._prepare_session_turn(
+            session,
+            processor,
+            request.user_text,
+            prompt_tokens,
+            user_tokens,
+        )
+        if turn_message:
+            yield StreamEvent(message=turn_message)
 
-        decoder = AudioStreamDecoder(
+        frame_decoder = _build_frame_decoder(
             codec,
+            inferencer,
+            device,
             chunk_frames=request.streaming.decode_chunk_frames,
             overlap_frames=request.streaming.decode_overlap_frames,
-            decode_kwargs={"chunk_duration": -1},
-            device=device,
         )
 
-        codebook_size = int(getattr(codec, "codebook_size", 1024))
-        audio_eos_token = int(getattr(inferencer, "audio_eos_token", 1026))
         text_tokens = tokenizer.encode(request.assistant_text, add_special_tokens=False)
         if not text_tokens:
             raise RuntimeError("Assistant text tokenization returned no tokens.")
 
-        callbacks = StreamingCallbacks()
-        token_stream = TokenChunkStream(text_tokens, request.streaming.text_chunk_tokens, callbacks)
-        frame_decoder = AudioFrameDecoder(decoder, codebook_size, audio_eos_token, callbacks)
-        buffer_tracker = BufferedAudioTracker(SAMPLE_RATE)
-
-        chunk_index = 0
-        has_audio = False
-        prebuffer_target = max(0.0, float(request.streaming.prebuffer_seconds))
-        prebuffering = prebuffer_target > 0.0
-        prebuffer_chunks: list[np.ndarray] = []
-        prebuffer_samples = 0
-
-        def _emit_buffered(chunks: list[np.ndarray], prefix: str):
-            nonlocal chunk_index, has_audio
-            for buffered in chunks:
-                chunk_index += 1
-                has_audio = True
-                buffer_tracker.add_chunk(buffered)
-                yield StreamEvent(message=f"{prefix} chunk {chunk_index}", audio=(SAMPLE_RATE, buffered))
-
-        def _emit_chunk(chunk: np.ndarray, prefix: str):
-            nonlocal prebuffering, prebuffer_samples, prebuffer_chunks
-            if prebuffering:
-                prebuffer_chunks.append(chunk)
-                prebuffer_samples += int(chunk.size)
-                buffered_seconds = prebuffer_samples / SAMPLE_RATE
-                if buffered_seconds < prebuffer_target:
-                    return
-                prebuffering = False
-                yield from _emit_buffered(prebuffer_chunks, prefix)
-                prebuffer_chunks = []
-                prebuffer_samples = 0
-                return
-            yield from _emit_buffered([chunk], prefix)
-
-        def _flush_prebuffer(prefix: str):
-            nonlocal prebuffering, prebuffer_samples, prebuffer_chunks
-            if not prebuffering or not prebuffer_chunks:
-                prebuffering = False
-                return
-            prebuffering = False
-            yield from _emit_buffered(prebuffer_chunks, prefix)
-            prebuffer_chunks = []
-            prebuffer_samples = 0
-
-        def _emit_chunks(chunks: Iterator[np.ndarray], prefix: str):
-            for chunk in chunks:
-                if chunk.size == 0:
-                    continue
-                yield from _emit_chunk(chunk, prefix)
+        token_stream = TokenChunkStream(text_tokens, request.streaming.text_chunk_tokens)
+        audio_emitter = StreamAudioEmitter(SAMPLE_RATE, request.streaming.prebuffer_seconds)
 
         with codec.streaming(batch_size=1):
             for token_chunk in token_stream:
-                _maybe_wait_for_buffer(buffer_tracker, request.streaming.buffer_threshold_seconds)
+                audio_emitter.wait_for_capacity(request.streaming.buffer_threshold_seconds)
                 audio_frames = session.push_text_tokens(token_chunk)
-                for event in _emit_chunks(frame_decoder.decode_frames(audio_frames), "Streaming"):
-                    yield event
+                yield from audio_emitter.emit_many(frame_decoder.decode_frames(audio_frames), "Streaming")
                 if request.streaming.input_delay > 0:
                     time.sleep(request.streaming.input_delay)
 
-            audio_frames = session.end_text()
-            for event in _emit_chunks(frame_decoder.decode_frames(audio_frames), "Finalizing"):
-                yield event
+            final_frames = session.end_text()
+            yield from audio_emitter.emit_many(frame_decoder.decode_frames(final_frames), "Finalizing")
 
             while True:
-                audio_frames = session.drain(max_steps=1)
-                if not audio_frames:
+                drain_frames = session.drain(max_steps=1)
+                if not drain_frames:
                     break
-                for event in _emit_chunks(frame_decoder.decode_frames(audio_frames), "Finalizing"):
-                    yield event
+                yield from audio_emitter.emit_many(frame_decoder.decode_frames(drain_frames), "Finalizing")
                 if session.inferencer.is_finished:
                     break
 
-            for event in _emit_chunks(frame_decoder.flush(), "Final"):
-                yield event
+            yield from audio_emitter.emit_many(frame_decoder.flush(), "Final")
+            yield from audio_emitter.flush("Final")
 
-            for event in _flush_prebuffer("Final"):
-                yield event
-
-        if not has_audio:
+        if not audio_emitter.has_audio:
             raise RuntimeError("No audio waveform chunks decoded from streaming inference.")
 
         yield StreamEvent(message="Streaming complete.")
+
+
+class WarmupManager:
+    def __init__(self, tts_demo: "StreamingTTSDemo", backend: BackendPaths):
+        self.tts_demo = tts_demo
+        self.backend = backend
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._started = False
+        self._state = "pending"
+        self._progress = 0.0
+        self._message = "Waiting for startup warmup."
+        self._detail = "The app warms the streaming path before the first real request."
+        self._error: str | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread = threading.Thread(target=self._run, name="tts-startup-warmup", daemon=True)
+            self._thread.start()
+
+    def snapshot(self) -> WarmupSnapshot:
+        with self._lock:
+            return WarmupSnapshot(
+                state=self._state,
+                progress=self._progress,
+                message=self._message,
+                detail=self._detail,
+                error=self._error,
+            )
+
+    def _set_state(
+        self,
+        *,
+        state: str | None = None,
+        progress: float | None = None,
+        message: str | None = None,
+        detail: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            if state is not None:
+                self._state = state
+            if progress is not None:
+                self._progress = max(0.0, min(1.0, float(progress)))
+            if message is not None:
+                self._message = message
+            if detail is not None:
+                self._detail = detail
+            self._error = error
+
+    @staticmethod
+    def _consume_audio(chunks: Iterator[np.ndarray]) -> None:
+        for _chunk in chunks:
+            pass
+
+    @staticmethod
+    def _ensure_warmup_text(tokenizer, minimum_tokens: int) -> tuple[str, list[int]]:
+        text = WARMUP_BASE_ASSISTANT_TEXT
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        while len(tokens) < minimum_tokens:
+            text = f"{text} {WARMUP_BASE_ASSISTANT_TEXT}"
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+        return text, tokens
+
+    @staticmethod
+    def _warmup_step_detail(step_idx: int, total_steps: int) -> str:
+        if step_idx == 1:
+            return "First incremental step is compiling the cold streaming path."
+        if step_idx == 2:
+            return "Second incremental step is warming the next steady-state path."
+        if step_idx == DEFAULT_REPETITION_WINDOW:
+            return "Warming the first full repetition-window step."
+        if step_idx == WARMUP_STEP_TOKENS:
+            return "Confirming the post-window steady-state step."
+        return f"Warming token step {step_idx}/{total_steps}."
+
+    def _run(self) -> None:
+        try:
+            self._set_state(
+                state="running",
+                progress=0.02,
+                message="Starting startup warmup.",
+                detail="Preparing backend state for the first real request.",
+                error=None,
+            )
+
+            self._set_state(
+                progress=0.08,
+                message="Loading backend.",
+                detail="Model, tokenizer, codec, and CUDA runtime are warming up.",
+                error=None,
+            )
+            model, tokenizer, processor, codec, device = self.tts_demo.get_or_load_backend(self.backend)
+
+            self._set_state(
+                progress=0.32,
+                message="Preparing streaming session.",
+                detail="Building a text-only warmup turn and its decoder.",
+                error=None,
+            )
+            session, inferencer = _build_streaming_session(
+                model,
+                tokenizer,
+                processor,
+                codec,
+                max_length=256,
+                chunk_duration=0.24,
+                temperature=0.8,
+                top_p=0.6,
+                top_k=30,
+                do_sample=True,
+                repetition_penalty=1.1,
+                repetition_window=DEFAULT_REPETITION_WINDOW,
+            )
+            session.clear_voice_prompt()
+            session.reset_turn(
+                input_ids=self.tts_demo._build_text_only_turn_input(processor, WARMUP_USER_TEXT, None),
+                include_system_prompt=True,
+                reset_cache=True,
+            )
+
+            frame_decoder = _build_frame_decoder(
+                codec,
+                inferencer,
+                device,
+                chunk_frames=WARMUP_STEP_TOKENS,
+                overlap_frames=0,
+            )
+
+            _, warmup_tokens = self._ensure_warmup_text(
+                tokenizer,
+                processor.delay_tokens_len + WARMUP_STEP_TOKENS,
+            )
+
+            with codec.streaming(batch_size=1):
+                self._set_state(
+                    progress=0.45,
+                    message="Running prefill.",
+                    detail="Building the first KV cache and warming the backbone path.",
+                    error=None,
+                )
+                prefill_frames = session.push_text_tokens(warmup_tokens[: processor.delay_tokens_len])
+                self._consume_audio(frame_decoder.decode_frames(prefill_frames))
+
+                step_tokens = warmup_tokens[
+                    processor.delay_tokens_len : processor.delay_tokens_len + WARMUP_STEP_TOKENS
+                ]
+                total_steps = max(1, len(step_tokens))
+                for idx, token in enumerate(step_tokens, start=1):
+                    self._set_state(
+                        progress=0.55 + 0.25 * (idx - 1) / total_steps,
+                        message="Compiling first streaming steps.",
+                        detail=self._warmup_step_detail(idx, total_steps),
+                        error=None,
+                    )
+                    step_frames = session.push_text_tokens([token])
+                    self._consume_audio(frame_decoder.decode_frames(step_frames))
+
+                self._set_state(
+                    progress=0.86,
+                    message="Warming finalization path.",
+                    detail="Priming end-text, drain, and decoder flush before user traffic.",
+                    error=None,
+                )
+                final_frames = session.end_text()
+                self._consume_audio(frame_decoder.decode_frames(final_frames))
+                drain_frames = session.drain(max_steps=1)
+                self._consume_audio(frame_decoder.decode_frames(drain_frames))
+                self._consume_audio(frame_decoder.flush())
+
+            self._set_state(
+                state="ready",
+                progress=1.0,
+                message="Warmup complete.",
+                detail="The first real request should avoid the cold-start stall.",
+                error=None,
+            )
+        except Exception as exc:
+            self._set_state(
+                state="failed",
+                progress=1.0,
+                message="Warmup failed.",
+                detail="The app did not finish startup warmup.",
+                error=str(exc),
+            )
+            print(f"[MossTTSRealtime][warmup-error] {exc}", file=sys.stderr, flush=True)
+
+
+def _warmup_button_update(snapshot: WarmupSnapshot):
+    if snapshot.ready:
+        return gr.update(value="Generate", interactive=True)
+    if snapshot.failed:
+        return gr.update(value="Warmup Failed", interactive=False)
+    return gr.update(value="Warming Up...", interactive=False)
+
+
+def _warmup_gate_message(snapshot: WarmupSnapshot) -> str:
+    progress_pct = int(round(max(0.0, min(1.0, snapshot.progress)) * 100.0))
+    if snapshot.failed:
+        return f"Warmup failed: {snapshot.error or snapshot.message}"
+    return f"Warmup in progress ({progress_pct}%): {snapshot.message}"
+
+
+def _status_from_snapshot(snapshot: WarmupSnapshot) -> str:
+    return "Ready." if snapshot.ready else _warmup_gate_message(snapshot)
+
+
+def _warmup_status_update(snapshot: WarmupSnapshot):
+    return gr.update(value=_status_from_snapshot(snapshot))
+
+
+def _warmup_timer_update(snapshot: WarmupSnapshot):
+    return gr.update(active=not (snapshot.ready or snapshot.failed))
 
 
 def _encode_chunk(sr: int, chunk: np.ndarray, idx: int) -> str:
@@ -541,6 +879,65 @@ def _encode_chunk(sr: int, chunk: np.ndarray, idx: int) -> str:
         "data": base64.b64encode(chunk.tobytes()).decode("ascii"),
     }
     return json.dumps(payload)
+
+
+def _build_request(
+    args: argparse.Namespace,
+    *,
+    user_text: str | None,
+    assistant_text: str | None,
+    prompt_audio: str | None,
+    user_audio: str | None,
+    use_default_prompt: bool,
+    use_default_user: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    repetition_window: int,
+    do_sample: bool,
+    max_length: int,
+    seed: float | int | None,
+    text_chunk_tokens: int,
+    input_delay: float,
+    decode_chunk_frames: int,
+    decode_overlap_frames: int,
+    chunk_duration: float,
+    prebuffer_seconds: float,
+) -> StreamingRequest:
+    return StreamingRequest(
+        user_text=str(user_text or "Hello!"),
+        assistant_text=str(assistant_text or ""),
+        prompt_audio=prompt_audio,
+        user_audio=user_audio,
+        use_default_prompt=use_default_prompt,
+        use_default_user=use_default_user,
+        generation=GenerationConfig(
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+            repetition_penalty=float(repetition_penalty),
+            repetition_window=int(repetition_window),
+            do_sample=bool(do_sample),
+            max_length=int(max_length),
+            seed=_normalize_seed(seed),
+        ),
+        streaming=StreamingConfig(
+            text_chunk_tokens=int(text_chunk_tokens),
+            input_delay=float(input_delay),
+            decode_chunk_frames=int(decode_chunk_frames),
+            decode_overlap_frames=int(decode_overlap_frames),
+            chunk_duration=float(chunk_duration),
+            prebuffer_seconds=float(prebuffer_seconds),
+        ),
+        backend=BackendPaths(
+            model_path=args.model_path,
+            tokenizer_path=args.tokenizer_path,
+            codec_model_path=args.codec_model_path,
+            device_str=args.device,
+            attn_impl=args.attn_implementation,
+        ),
+    )
 
 
 STREAM_PLAYER_HTML = """
@@ -559,13 +956,6 @@ STREAM_PLAYER_HTML = """
   opacity: 0 !important;
 }
 </style>
-<div id="pcm-stream-status" style="font-size: 12px; color: #555;">
-  Live playback uses Web Audio API. Click Generate to unlock audio. First load may take a while.
-</div>
-<div id="pcm-stream-meta" style="font-size: 12px; color: #333; margin: 6px 0;">
-  <div>Now Playing Chunk: <span id="pcm-stream-playing">-</span></div>
-  <div>Last Yielded Chunk: <span id="pcm-stream-yielded">-</span></div>
-</div>
 """
 
 STREAM_PLAYER_JS = r"""
@@ -583,25 +973,6 @@ let boundField = null;
 let usingSetterHook = false;
 const FADE_MS = 6;
 const MIN_BUFFER_SEC = 0.25;
-
-const statusEl = document.getElementById("pcm-stream-status");
-const playingEl = document.getElementById("pcm-stream-playing");
-const yieldedEl = document.getElementById("pcm-stream-yielded");
-function setStatus(msg) {
-  if (statusEl) {
-    statusEl.textContent = msg;
-  }
-}
-function setPlaying(idx) {
-  if (playingEl) {
-    playingEl.textContent = `${idx}`;
-  }
-}
-function setYielded(idx) {
-  if (yieldedEl) {
-    yieldedEl.textContent = `${idx}`;
-  }
-}
 
 function initAudio(sr) {
   if (audioCtx && audioCtx.sampleRate !== sr) {
@@ -649,8 +1020,6 @@ function playChunk(samples, sr, idx) {
   gain.gain.linearRampToValueAtTime(0.0, endTime);
   source.start(startTime);
   nextTime = endTime;
-  setPlaying(idx);
-  setStatus(`Streaming... (chunk ${idx})`);
 }
 
 function handlePayload(text) {
@@ -679,9 +1048,6 @@ function handlePayloadObject(payload) {
       audioCtx.close();
       audioCtx = null;
     }
-    setPlaying("-");
-    setYielded("-");
-    setStatus("Live playback uses Web Audio API. Click Generate to unlock audio. First load may take a while.");
     return;
   }
   const idx = payload.idx ?? 0;
@@ -689,7 +1055,6 @@ function handlePayloadObject(payload) {
   lastIdx = idx;
   const sr = payload.sr || 24000;
   const samples = decodeBase64ToFloat32(payload.data);
-  setYielded(idx);
   playChunk(samples, sr, idx);
 }
 
@@ -779,9 +1144,12 @@ pollValue();
 """
 
 
-def _build_demo(args: argparse.Namespace):
-    tts_demo = StreamingTTSDemo()
-
+def _build_demo(
+    args: argparse.Namespace,
+    tts_demo: StreamingTTSDemo,
+    warmup_manager: WarmupManager,
+):
+    initial_warmup_snapshot = warmup_manager.snapshot()
     with gr.Blocks(title="MossTTSRealtime") as demo:
         gr.Markdown("MossTTSRealtime demo")
         gr.Markdown("Note: The first run may take a while to load the model.")
@@ -801,7 +1169,9 @@ def _build_demo(args: argparse.Namespace):
                     top_p = gr.Slider(0.1, 1.0, value=0.6, step=0.05, label="Top P")
                     top_k = gr.Slider(1, 100, value=30, step=1, label="Top K")
                     repetition_penalty = gr.Slider(1.0, 2.0, value=1.1, step=0.05, label="Repetition Penalty")
-                    repetition_window = gr.Slider(1, 200, value=50, step=1, label="Repetition Window")
+                    repetition_window = gr.Slider(
+                        1, 200, value=DEFAULT_REPETITION_WINDOW, step=1, label="Repetition Window"
+                    )
                     do_sample = gr.Checkbox(label="Do Sample", value=True)
                     max_length = gr.Slider(100, 10000, value=2000, step=10, label="Max Length")
                     seed = gr.Number(value=0, precision=0, label="Seed (0 for random)")
@@ -809,17 +1179,32 @@ def _build_demo(args: argparse.Namespace):
                 with gr.Accordion("Streaming Options", open=False):
                     stream_text_chunk_tokens = gr.Slider(1, 64, value=12, step=1, label="Text Chunk Tokens")
                     stream_input_delay = gr.Slider(0.0, 0.5, value=0.0, step=0.05, label="Input Delay (s)")
-                    stream_decode_chunk_frames = gr.Slider(0, 20, value=12, step=1, label="Decode Chunk Frames")
+                    stream_decode_chunk_frames = gr.Slider(1, 20, value=12, step=1, label="Decode Chunk Frames")
                     stream_decode_overlap_frames = gr.Slider(0, 10, value=0, step=1, label="Decode Overlap Frames")
-                    chunk_duration = gr.Slider(0.0, 1.0, value=0.24, step=0.01, label="Codec Chunk Duration (s)")
+                    chunk_duration = gr.Slider(0.01, 1.0, value=0.24, step=0.01, label="Codec Chunk Duration (s)")
                     stream_prebuffer_seconds = gr.Slider(0.0, 20.0, value=0.0, step=0.05, label="Initial Buffer (s)")
 
-                run_btn = gr.Button("Generate", elem_id="tts_generate")
+                run_btn = gr.Button(
+                    "Generate" if initial_warmup_snapshot.ready else "Warming Up...",
+                    elem_id="tts_generate",
+                    interactive=initial_warmup_snapshot.ready,
+                )
 
             with gr.Column():
                 stream_data = gr.Textbox(label="PCM Stream (JSON)", elem_id="pcm_stream", interactive=False, lines=6)
                 output_audio = gr.Audio(label="Final Audio", type="numpy")
-                status = gr.Textbox(label="Status", lines=3)
+                initial_status = _status_from_snapshot(initial_warmup_snapshot)
+                status = gr.Textbox(label="Status", lines=3, value=initial_status)
+
+        warmup_timer = gr.Timer(value=WARMUP_POLL_INTERVAL_SECONDS, active=True)
+
+        def _poll_warmup_state():
+            snapshot = warmup_manager.snapshot()
+            return (
+                _warmup_button_update(snapshot),
+                _warmup_status_update(snapshot),
+                _warmup_timer_update(snapshot),
+            )
 
         def _on_generate(
             user_text_value,
@@ -843,49 +1228,39 @@ def _build_demo(args: argparse.Namespace):
             chunk_duration_value,
             stream_prebuffer_seconds_value,
         ):
+            warmup_snapshot = warmup_manager.snapshot()
+            if not warmup_snapshot.ready:
+                yield json.dumps({"reset": True}), gr.update(value=None), _warmup_gate_message(warmup_snapshot)
+                return
             try:
                 started_at = time.monotonic()
-                seed = None if seed_value is None else int(seed_value)
-                if seed == 0:
-                    seed = None
                 full_chunks: list[np.ndarray] = []
                 first_chunk_time: float | None = None
                 sample_rate = SAMPLE_RATE
-                stream_reset = json.dumps({"reset": True})
-                yield stream_reset, gr.update(value=None), "Started"
+                yield json.dumps({"reset": True}), gr.update(value=None), "Started"
 
-                request = StreamingRequest(
-                    user_text=str(user_text_value or "Hello!"),
-                    assistant_text=str(assistant_text_value or ""),
+                request = _build_request(
+                    args,
+                    user_text=user_text_value,
+                    assistant_text=assistant_text_value,
                     prompt_audio=prompt_audio_value,
                     user_audio=user_audio_value,
                     use_default_prompt=bool(use_default_prompt_value),
                     use_default_user=bool(use_default_user_value),
-                    generation=GenerationConfig(
-                        temperature=float(temperature_value),
-                        top_p=float(top_p_value),
-                        top_k=int(top_k_value),
-                        repetition_penalty=float(repetition_penalty_value),
-                        repetition_window=int(repetition_window_value),
-                        do_sample=bool(do_sample_value),
-                        max_length=int(max_length_value),
-                        seed=seed,
-                    ),
-                    streaming=StreamingConfig(
-                        text_chunk_tokens=int(stream_text_chunk_tokens_value),
-                        input_delay=float(stream_input_delay_value),
-                        decode_chunk_frames=int(stream_decode_chunk_frames_value),
-                        decode_overlap_frames=int(stream_decode_overlap_frames_value),
-                        chunk_duration=float(chunk_duration_value),
-                        prebuffer_seconds=float(stream_prebuffer_seconds_value),
-                    ),
-                    backend=BackendPaths(
-                        model_path=args.model_path,
-                        tokenizer_path=args.tokenizer_path,
-                        codec_model_path=args.codec_model_path,
-                        device_str=args.device,
-                        attn_impl=args.attn_implementation,
-                    ),
+                    temperature=float(temperature_value),
+                    top_p=float(top_p_value),
+                    top_k=int(top_k_value),
+                    repetition_penalty=float(repetition_penalty_value),
+                    repetition_window=int(repetition_window_value),
+                    do_sample=bool(do_sample_value),
+                    max_length=int(max_length_value),
+                    seed=seed_value,
+                    text_chunk_tokens=int(stream_text_chunk_tokens_value),
+                    input_delay=float(stream_input_delay_value),
+                    decode_chunk_frames=int(stream_decode_chunk_frames_value),
+                    decode_overlap_frames=int(stream_decode_overlap_frames_value),
+                    chunk_duration=float(chunk_duration_value),
+                    prebuffer_seconds=float(stream_prebuffer_seconds_value),
                 )
 
                 for event in tts_demo.run_stream(request):
@@ -909,15 +1284,13 @@ def _build_demo(args: argparse.Namespace):
 
                 if full_chunks:
                     full_audio = np.concatenate(full_chunks)
-                    elapsed = time.monotonic() - started_at
-                    audio_seconds = float(full_audio.size) / float(sample_rate) if full_audio.size > 0 else 0.0
-                    rtf = (elapsed / audio_seconds) if audio_seconds > 0 else float("inf")
-                    done_msg = (
-                        f"Done | chunks={len(full_chunks)} | audio={audio_seconds:.2f}s | "
-                        f"elapsed={elapsed:.2f}s | RTF={rtf:.3f}"
+                    done_msg = _format_completion_status(
+                        len(full_chunks),
+                        sample_rate,
+                        full_audio,
+                        started_at,
+                        first_chunk_time,
                     )
-                    if first_chunk_time is not None:
-                        done_msg += f" | TTFB={(first_chunk_time - started_at) * 1000.0:.0f}ms"
                     yield gr.update(), (sample_rate, full_audio), done_msg
                 else:
                     yield gr.update(), gr.update(), "Done | no audio chunks emitted"
@@ -952,6 +1325,18 @@ def _build_demo(args: argparse.Namespace):
             ],
             outputs=[stream_data, output_audio, status],
         )
+        demo.load(
+            _poll_warmup_state,
+            outputs=[run_btn, status, warmup_timer],
+            queue=False,
+            show_progress="hidden",
+        )
+        warmup_timer.tick(
+            _poll_warmup_state,
+            outputs=[run_btn, status, warmup_timer],
+            queue=False,
+            show_progress="hidden",
+        )
 
     return demo
 
@@ -973,7 +1358,19 @@ def main():
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
-    demo = _build_demo(args)
+    tts_demo = StreamingTTSDemo()
+    warmup_manager = WarmupManager(
+        tts_demo,
+        BackendPaths(
+            model_path=args.model_path,
+            tokenizer_path=args.tokenizer_path,
+            codec_model_path=args.codec_model_path,
+            device_str=args.device,
+            attn_impl=args.attn_implementation,
+        ),
+    )
+    warmup_manager.start()
+    demo = _build_demo(args, tts_demo, warmup_manager)
     demo.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name=args.host,
         server_port=args.port,

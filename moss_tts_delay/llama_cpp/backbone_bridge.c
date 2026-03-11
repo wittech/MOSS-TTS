@@ -22,13 +22,20 @@ typedef struct {
 } bridge_handle_t;
 
 /* Create model + context with embeddings enabled.
+ * type_k / type_v: ggml_type enum values for KV cache quantization
+ *   (pass -1 to keep llama.cpp defaults, i.e. GGML_TYPE_F16).
+ * flash_attn: llama_flash_attn_type enum value
+ *   (-1 = auto, 0 = disabled, 1 = enabled).
  * Returns opaque handle, or NULL on failure. */
 bridge_handle_t *bridge_create(
     const char *model_path,
     int32_t     n_ctx,
     int32_t     n_batch,
     int32_t     n_threads,
-    int32_t     n_gpu_layers)
+    int32_t     n_gpu_layers,
+    int32_t     type_k,
+    int32_t     type_v,
+    int32_t     flash_attn)
 {
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = n_gpu_layers;
@@ -46,6 +53,13 @@ bridge_handle_t *bridge_create(
     cp.n_threads     = n_threads;
     cp.n_threads_batch = n_threads;
     cp.embeddings    = true;
+
+    if (type_k >= 0) cp.type_k = (enum ggml_type)type_k;
+    if (type_v >= 0) cp.type_v = (enum ggml_type)type_v;
+    cp.flash_attn_type = (enum llama_flash_attn_type)flash_attn;
+
+    fprintf(stderr, "bridge_create: type_k=%d, type_v=%d, flash_attn=%d\n",
+            (int)cp.type_k, (int)cp.type_v, (int)cp.flash_attn_type);
 
     struct llama_context *ctx = llama_init_from_model(model, cp);
     if (!ctx) {

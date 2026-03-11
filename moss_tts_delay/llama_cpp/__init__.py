@@ -10,6 +10,9 @@ pipeline using:
 When PyTorch is available, LM heads can optionally be GPU-accelerated
 via ``heads_backend: torch`` in the config.
 
+Set ``low_memory: true`` in the config to enable staged loading for
+GPUs with limited VRAM (8-16 GB).
+
 Quick start::
 
     from moss_tts_delay.llama_cpp import LlamaCppPipeline, PipelineConfig

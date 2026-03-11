@@ -193,16 +193,17 @@ class MossTTSDelayModel(MossTTSDelayPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self, input_ids: torch.LongTensor) -> torch.Tensor:
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def _compute_input_embeddings(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """
         Computes the combined embeddings from text and multiple audio VQ channels.
-        
+
         Args:
             input_ids: Shape (Batch, Seq_Len, 1 + n_vq)
         """
-        # Base Text/Content Embedding
-        # input_ids[..., 0] is standard text or semantic tokens
-        inputs_embeds = self.language_model.get_input_embeddings()(input_ids[..., 0])
+        inputs_embeds = self.get_input_embeddings()(input_ids[..., 0])
 
         # Add VQ Embeddings
         for i, embed_layer in enumerate(self.emb_ext):
@@ -257,7 +258,7 @@ class MossTTSDelayModel(MossTTSDelayPreTrainedModel):
 
         # 1. Prepare Embeddings
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings(input_ids)
+            inputs_embeds = self._compute_input_embeddings(input_ids)
 
         # 2. Backbone Forward
         # Qwen3Model outputs standard CausalLMOutputWithPast or similar

@@ -1,6 +1,10 @@
 # Architecture: Global Transformer + Delay-Pattern (MossTTSDelay)
 
-This document details the **MossTTSDelay** architecture, the production-grade variant of the MOSS-TTS family. It employs a **Single Transformer** backbone with **Multi-Head Parallel Prediction** and a **Delay-Pattern** scheduling mechanism to achieve high-speed, stable, and long-form speech synthesis.
+This document details the **MossTTSDelay** architecture, the production-grade variant of the MOSS-TTS family. It employs a **Single Transformer** backbone with **Multi-Head Parallel Prediction** and a **Delay-Pattern** scheduling mechanism to achieve high-speed, stable, and long-form speech synthesis. The architecture diagram is shown in the figure.
+
+<p align="center">
+  <img src="../assets/archi_delay.png" width="60%" />
+</p>
 
 ---
 

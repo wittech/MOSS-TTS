@@ -32,6 +32,7 @@
 MOSS‑TTS Family is an open‑source **speech and sound generation model family** from [MOSI.AI](https://mosi.cn/#hero) and the [OpenMOSS team](https://www.open-moss.com/). It is designed for **high‑fidelity**, **high‑expressiveness**, and **complex real‑world scenarios**, covering stable long‑form speech, multi‑speaker dialogue, voice/character design, environmental sound effects, and real‑time streaming TTS.
 
 ## News
+* 2026.3.10: ⚡️ Significantly optimized the VRAM usage of llama.cpp inference pipeline. Now 8B model fits onto 8GB GPUs !
 * 2026.3.4: 🚀 Added **PyTorch-free inference support** — enabling lightweight on-device deployment via **llama.cpp + ONNX Runtime**. Quantized **GGUF weights** are released at [OpenMOSS-Team/MOSS-TTS-GGUF](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-GGUF), and the **ONNX audio tokenizer** is available at [OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX](https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX). See the [llama.cpp backend](#llamacpp-backend-torch-free-inference) for details.
 * 2026.3.4: 🎉 We add MOSS-TTS skills in [ClawHub](https://clawhub.ai) of 🦞 OpenClaw: [feishu-voice-tts](https://clawhub.ai/helloeveryworlds/feishu-voice-tts) and [moss-tts-voice](https://clawhub.ai/luogao2333/moss-tts-voice).
 * 2026.2.10: 🎉🎉🎉 We have released [MOSS-TTS Family](https://huggingface.co/collections/OpenMOSS-Team/moss-tts). Check our [Blog](https://mosi.cn/#models) for more details! Our **Huggingface Space** is here: [MOSS-TTS](https://huggingface.co/spaces/OpenMOSS-Team/MOSS-TTS), [MOSS-TTSD-v1.0](https://huggingface.co/spaces/OpenMOSS-Team/MOSS-TTSD-v1.0), [MOSS-VoiceGenerator](https://huggingface.co/spaces/OpenMOSS-Team/MOSS-VoiceGenerator).
@@ -54,6 +55,7 @@ MOSS‑TTS Family is an open‑source **speech and sound generation model family
   - [Environment Setup](#environment-setup)
   - [(Optional) Install FlashAttention 2](#optional-install-flashattention-2)
   - [MOSS-TTS Basic Usage](#moss-tts-basic-usage)
+- [Fine-Tuning](#fine-tuning)
 - [llama.cpp Backend (Torch-Free Inference)](#llamacpp-backend-torch-free-inference)
 - [Evaluation](#evaluation)
   - [MOSS-TTS](#moss-tts-seed-tts-eval)
@@ -321,6 +323,16 @@ with torch.no_grad():
 
 For each model’s full usage, please refer to its corresponding model card.
 
+<a id="fine-tuning"></a>
+## Fine-Tuning
+
+Finetuning tutorials are organized by architecture.
+
+Currently available:
+
+- `MossTTSDelay` / `OpenMOSS-Team/MOSS-TTS`: [moss_tts_delay/finetuning/README.md](moss_tts_delay/finetuning/README.md)
+
+Additional architecture-specific finetuning tutorials will be added under their corresponding directories.
 
 ## llama.cpp Backend (Torch-Free Inference)
 
@@ -345,6 +357,11 @@ cd moss_tts_delay/llama_cpp && bash build_bridge.sh /path/to/llama.cpp && cd ../
 python -m moss_tts_delay.llama_cpp \
     --config configs/llama_cpp/default.yaml \
     --text "Hello, world!" --output output.wav
+
+# 6. (Optional) Low-memory mode for 8 GB GPUs — loads/unloads components per stage
+python -m moss_tts_delay.llama_cpp \
+    --config configs/llama_cpp/trt-8gb.yaml \
+    --text "Hello, world!" --output output.wav
 ```
 
 ### Installation Profiles
@@ -368,15 +385,19 @@ python -m moss_tts_delay.llama_cpp \
 
 ### Configuration
 
-Three pre-built configs are provided in `configs/llama_cpp/`:
+Four pre-built configs are provided in `configs/llama_cpp/`:
 
 - `default.yaml` — ONNX audio + GGUF backbone (recommended start)
 - `trt.yaml` — TensorRT audio + GGUF backbone (max throughput, user-built engines)
+- `trt-8gb.yaml` — Low-memory mode for 8 GB GPUs (staged loading, TRT audio)
 - `cpu-only.yaml` — fully CPU-based (no GPU required)
 
 Key config options:
 - `heads_backend: auto | numpy | torch` — LM heads computation backend
 - `audio_backend: onnx | trt | torch` — audio tokenizer backend
+- `low_memory: true | false` — staged loading for limited VRAM (loads/unloads encoder, backbone, decoder per stage)
+- `kv_cache_type_k / kv_cache_type_v` — KV cache quantization (e.g. `q8_0`, `q4_0`) to reduce VRAM
+- `flash_attn: auto | enabled | disabled` — flash attention for lower peak VRAM during prefill
 
 For full documentation, see [moss_tts_delay/llama_cpp/README.md](moss_tts_delay/llama_cpp/README.md).
 
